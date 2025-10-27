@@ -1,0 +1,140 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String
+  firstName String
+  lastName  String
+  phone     String?
+  role      UserRole @default(PATIENT)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relaciones
+  patientAppointments PatientAppointment[]
+  doctorAppointments  DoctorAppointment[]
+  doctorInfo          DoctorInfo?
+
+  @@map("users")
+}
+
+model DoctorInfo {
+  id           String  @id @default(cuid())
+  userId       String  @unique
+  license      String  @unique
+  specialties  String[] // Array de especialidades
+  experience   Int     @default(0) // Años de experiencia
+  consultationFee Float
+  bio          String?
+  isAvailable  Boolean @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Relaciones
+  user                User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  patientAppointments PatientAppointment[]
+  doctorAppointments  DoctorAppointment[]
+  schedules           DoctorSchedule[]
+
+  @@map("doctor_info")
+}
+
+model Specialty {
+  id          String @id @default(cuid())
+  name        String @unique
+  description String?
+  isActive    Boolean @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relaciones
+  patientAppointments PatientAppointment[]
+  doctorAppointments  DoctorAppointment[]
+
+  @@map("specialties")
+}
+
+model DoctorSchedule {
+  id        String   @id @default(cuid())
+  doctorId  String
+  dayOfWeek Int      // 0 = Domingo, 1 = Lunes, etc.
+  startTime String   // Formato HH:MM
+  endTime   String   // Formato HH:MM
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relaciones
+  doctor DoctorInfo @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  @@map("doctor_schedules")
+}
+
+model PatientAppointment {
+  id          String            @id @default(cuid())
+  patientId   String
+  doctorId    String
+  specialtyId String
+  date        DateTime
+  time        String            // Formato HH:MM
+  status      AppointmentStatus @default(SCHEDULED)
+  reason      String?
+  notes       String?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  // Relaciones
+  patient    User      @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  doctor     DoctorInfo @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  specialty  Specialty @relation(fields: [specialtyId], references: [id])
+
+  @@map("patient_appointments")
+}
+
+model DoctorAppointment {
+  id          String            @id @default(cuid())
+  doctorId    String
+  patientId   String
+  specialtyId String
+  date        DateTime
+  time        String            // Formato HH:MM
+  status      AppointmentStatus @default(SCHEDULED)
+  reason      String?
+  notes       String?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  // Relaciones
+  doctor     DoctorInfo @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  patient    User       @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  specialty  Specialty  @relation(fields: [specialtyId], references: [id])
+
+  @@map("doctor_appointments")
+}
+
+enum UserRole {
+  PATIENT
+  DOCTOR
+  ADMIN
+}
+
+enum AppointmentStatus {
+  SCHEDULED
+  CONFIRMED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
