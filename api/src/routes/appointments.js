@@ -51,32 +51,86 @@ router.post('/', authenticateToken, requireRole('PATIENT'), validateAppointment,
     }
 
     // Verificar que la fecha no sea en el pasado
-    const appointmentDate = new Date(date);
+    // Usar formato local para evitar problemas de timezone
+    const [year, month, day] = date.split('-').map(Number);
+    const appointmentDate = new Date(year, month - 1, day);
     const now = new Date();
-    if (appointmentDate <= now) {
+    now.setHours(0, 0, 0, 0);
+    
+    if (appointmentDate < now) {
       return res.status(400).json({
         success: false,
         message: 'No se pueden agendar citas en el pasado'
       });
     }
 
-    // Verificar que no hay conflicto de horario
-    const existingAppointment = await prisma.patientAppointment.findFirst({
+    // Verificar que no hay conflicto de horario con solapamiento
+    // Asumimos que cada cita dura 30 minutos
+    const APPOINTMENT_DURATION_MINUTES = 30;
+    
+    // Convertir hora a minutos para comparación
+    const [hours, minutes] = time.split(':').map(Number);
+    const timeInMinutes = hours * 60 + minutes;
+    const endTimeInMinutes = timeInMinutes + APPOINTMENT_DURATION_MINUTES;
+    
+    // Obtener todas las citas del doctor en esa fecha
+    const existingAppointments = await prisma.patientAppointment.findMany({
       where: {
         doctorId,
         date: appointmentDate,
-        time,
         status: {
-          in: ['SCHEDULED', 'CONFIRMED']
+          in: ['SCHEDULED', 'CONFIRMED', 'IN_PROGRESS']
         }
       }
     });
 
-    if (existingAppointment) {
-      return res.status(400).json({
-        success: false,
-        message: 'Ya existe una cita en este horario'
-      });
+    // Verificar solapamiento con cada cita existente
+    for (const existing of existingAppointments) {
+      const [existHours, existMinutes] = existing.time.split(':').map(Number);
+      const existTimeInMinutes = existHours * 60 + existMinutes;
+      const existEndTimeInMinutes = existTimeInMinutes + APPOINTMENT_DURATION_MINUTES;
+
+      // Verificar si hay solapamiento
+      const hasOverlap = 
+        (timeInMinutes >= existTimeInMinutes && timeInMinutes < existEndTimeInMinutes) || // La nueva cita inicia durante una cita existente
+        (endTimeInMinutes > existTimeInMinutes && endTimeInMinutes <= existEndTimeInMinutes) || // La nueva cita termina durante una cita existente
+        (timeInMinutes <= existTimeInMinutes && endTimeInMinutes >= existEndTimeInMinutes); // La nueva cita abarca completamente una cita existente
+
+      if (hasOverlap) {
+        return res.status(400).json({
+          success: false,
+          message: `Ya existe una cita que se solapa con este horario. Cita existente: ${existing.time} - ${Math.floor(existEndTimeInMinutes/60)}:${(existEndTimeInMinutes%60).toString().padStart(2,'0')}`
+        });
+      }
+    }
+
+    // Verificar que el paciente no tenga otra cita a la misma hora
+    const patientConflict = await prisma.patientAppointment.findFirst({
+      where: {
+        patientId,
+        date: appointmentDate,
+        status: {
+          in: ['SCHEDULED', 'CONFIRMED', 'IN_PROGRESS']
+        }
+      }
+    });
+
+    if (patientConflict) {
+      const [pHours, pMinutes] = patientConflict.time.split(':').map(Number);
+      const pTimeInMinutes = pHours * 60 + pMinutes;
+      const pEndTimeInMinutes = pTimeInMinutes + APPOINTMENT_DURATION_MINUTES;
+
+      const patientHasOverlap = 
+        (timeInMinutes >= pTimeInMinutes && timeInMinutes < pEndTimeInMinutes) ||
+        (endTimeInMinutes > pTimeInMinutes && endTimeInMinutes <= pEndTimeInMinutes) ||
+        (timeInMinutes <= pTimeInMinutes && endTimeInMinutes >= pEndTimeInMinutes);
+
+      if (patientHasOverlap) {
+        return res.status(400).json({
+          success: false,
+          message: 'Ya tienes una cita agendada en este horario'
+        });
+      }
     }
 
     // Crear la cita
@@ -209,6 +263,114 @@ router.get('/', authenticateToken, validatePagination, async (req, res) => {
     });
   } catch (error) {
     console.error('Error obteniendo citas:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error interno del servidor'
+    });
+  }
+});
+
+// @route   GET /api/appointments/available-slots
+// @desc    Obtener horarios disponibles para un doctor en una fecha
+// @access  Public
+router.get('/available-slots', async (req, res) => {
+  try {
+    const { doctorId, date } = req.query;
+
+    if (!doctorId || !date) {
+      return res.status(400).json({
+        success: false,
+        message: 'doctorId y date son requeridos'
+      });
+    }
+
+    // Parsear fecha en formato local para evitar problemas de timezone
+    const [year, month, day] = date.split('-').map(Number);
+    const appointmentDate = new Date(year, month - 1, day);
+    const dayOfWeek = appointmentDate.getDay();
+
+    // Obtener horario del doctor para este día
+    const schedule = await prisma.doctorSchedule.findFirst({
+      where: {
+        doctorId,
+        dayOfWeek,
+        isActive: true
+      }
+    });
+
+    if (!schedule) {
+      return res.json({
+        success: true,
+        data: { slots: [] }
+      });
+    }
+
+    // Obtener citas existentes para esta fecha
+    const existingAppointments = await prisma.patientAppointment.findMany({
+      where: {
+        doctorId,
+        date: appointmentDate,
+        status: {
+          in: ['SCHEDULED', 'CONFIRMED', 'IN_PROGRESS']
+        }
+      },
+      select: { time: true }
+    });
+
+    const APPOINTMENT_DURATION_MINUTES = 30;
+
+    // Convertir citas existentes a rangos de tiempo (en minutos)
+    const bookedRanges = existingAppointments.map(apt => {
+      const [hours, minutes] = apt.time.split(':').map(Number);
+      const startMinutes = hours * 60 + minutes;
+      return {
+        start: startMinutes,
+        end: startMinutes + APPOINTMENT_DURATION_MINUTES
+      };
+    });
+
+    // Generar slots de 30 minutos
+    const slots = [];
+    const startTime = schedule.startTime;
+    const endTime = schedule.endTime;
+
+    const [startHour, startMin] = startTime.split(':').map(Number);
+    const [endHour, endMin] = endTime.split(':').map(Number);
+
+    let currentHour = startHour;
+    let currentMin = startMin;
+
+    while (currentHour < endHour || (currentHour === endHour && currentMin < endMin)) {
+      const currentTimeInMinutes = currentHour * 60 + currentMin;
+      const currentEndTimeInMinutes = currentTimeInMinutes + APPOINTMENT_DURATION_MINUTES;
+      
+      // Verificar si este slot se solapa con alguna cita existente
+      const hasOverlap = bookedRanges.some(range => {
+        return (
+          (currentTimeInMinutes >= range.start && currentTimeInMinutes < range.end) ||
+          (currentEndTimeInMinutes > range.start && currentEndTimeInMinutes <= range.end) ||
+          (currentTimeInMinutes <= range.start && currentEndTimeInMinutes >= range.end)
+        );
+      });
+
+      if (!hasOverlap) {
+        const timeString = `${currentHour.toString().padStart(2, '0')}:${currentMin.toString().padStart(2, '0')}`;
+        slots.push(timeString);
+      }
+
+      currentMin += 30;
+      if (currentMin >= 60) {
+        currentMin = 0;
+        currentHour++;
+      }
+    }
+
+    res.json({
+      success: true,
+      data: { slots }
+    });
+  } catch (error) {
+    console.error('Error obteniendo horarios disponibles:', error);
     res.status(500).json({
       success: false,
       message: 'Error interno del servidor'
@@ -446,91 +608,6 @@ router.delete('/:id', authenticateToken, validateUUID('id'), async (req, res) =>
     });
   } catch (error) {
     console.error('Error cancelando cita:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error interno del servidor'
-    });
-  }
-});
-
-// @route   GET /api/appointments/available-slots
-// @desc    Obtener horarios disponibles para un doctor en una fecha
-// @access  Public
-router.get('/available-slots', async (req, res) => {
-  try {
-    const { doctorId, date } = req.query;
-
-    if (!doctorId || !date) {
-      return res.status(400).json({
-        success: false,
-        message: 'doctorId y date son requeridos'
-      });
-    }
-
-    const appointmentDate = new Date(date);
-    const dayOfWeek = appointmentDate.getDay();
-
-    // Obtener horario del doctor para este día
-    const schedule = await prisma.doctorSchedule.findFirst({
-      where: {
-        doctorId,
-        dayOfWeek,
-        isActive: true
-      }
-    });
-
-    if (!schedule) {
-      return res.json({
-        success: true,
-        data: { slots: [] }
-      });
-    }
-
-    // Obtener citas existentes para esta fecha
-    const existingAppointments = await prisma.patientAppointment.findMany({
-      where: {
-        doctorId,
-        date: appointmentDate,
-        status: {
-          in: ['SCHEDULED', 'CONFIRMED']
-        }
-      },
-      select: { time: true }
-    });
-
-    const bookedTimes = existingAppointments.map(apt => apt.time);
-
-    // Generar slots de 30 minutos
-    const slots = [];
-    const startTime = schedule.startTime;
-    const endTime = schedule.endTime;
-
-    const [startHour, startMin] = startTime.split(':').map(Number);
-    const [endHour, endMin] = endTime.split(':').map(Number);
-
-    let currentHour = startHour;
-    let currentMin = startMin;
-
-    while (currentHour < endHour || (currentHour === endHour && currentMin < endMin)) {
-      const timeString = `${currentHour.toString().padStart(2, '0')}:${currentMin.toString().padStart(2, '0')}`;
-      
-      if (!bookedTimes.includes(timeString)) {
-        slots.push(timeString);
-      }
-
-      currentMin += 30;
-      if (currentMin >= 60) {
-        currentMin = 0;
-        currentHour++;
-      }
-    }
-
-    res.json({
-      success: true,
-      data: { slots }
-    });
-  } catch (error) {
-    console.error('Error obteniendo horarios disponibles:', error);
     res.status(500).json({
       success: false,
       message: 'Error interno del servidor'

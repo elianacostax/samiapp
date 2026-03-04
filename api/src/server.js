@@ -19,11 +19,35 @@ const PORT = process.env.PORT || 3000;
 // Middleware de seguridad
 app.use(helmet());
 
-// CORS
-app.use(cors({
-  origin: process.env.CORS_ORIGIN || 'http://localhost:3001',
-  credentials: true
-}));
+// CORS - Configuración permisiva para desarrollo
+if (process.env.NODE_ENV === 'production') {
+  // En producción, usar configuración estricta
+  const allowedOrigins = process.env.CORS_ORIGIN 
+    ? process.env.CORS_ORIGIN.split(',')
+    : [];
+  
+  app.use(cors({
+    origin: function (origin, callback) {
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.indexOf(origin) === -1) {
+        return callback(new Error('CORS policy violation'), false);
+      }
+      return callback(null, true);
+    },
+    credentials: true
+  }));
+} else {
+  // En desarrollo, permitir todos los orígenes de localhost
+  app.use(cors({
+    origin: true,
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    exposedHeaders: ['Content-Range', 'X-Content-Range'],
+    maxAge: 600
+  }));
+  console.log('🌐 CORS habilitado para todos los orígenes (modo desarrollo)');
+}
 
 // Rate limiting
 const limiter = rateLimit({
